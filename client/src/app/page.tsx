@@ -1,11 +1,12 @@
 'use client';
 
 import React from 'react';
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip } from "recharts";
 
 export default function Home() {
-	const [data, setData] = React.useState([]);
 	const [port, setPort] = React.useState(null);
 	const [reader, setReader] = React.useState(null);
+	const audioRef = React.useRef<HTMLAudioElement>(null);
 
 	async function connect() {
 		const serialPort = await navigator.serial.requestPort();
@@ -16,11 +17,24 @@ export default function Home() {
 		setPort(serialPort);
 		setReader(portReader);
 
+		const mediaSource = new MediaSource();
+		audioRef.current.src = URL.createObjectURL(mediaSource);
+
+		let sourceBuffer: SourceBuffer;
+
+		mediaSource.addEventListener("sourceopen", () => {
+			sourceBuffer = mediaSource.addSourceBuffer('audio/wav;');
+		});
+
 		while (true) {
 			const { value, done } = await portReader.read();
-			console.log(value);
 			if (done) break;
-			setData((prevData) => [...prevData, value]);
+
+			if (sourceBuffer && !sourceBuffer.updating) {
+				let chunk = new Uint8Array(value);
+				console.log(chunk.length);
+				sourceBuffer.appendBuffer(chunk);
+			}
 		}
 	}
 
@@ -46,13 +60,7 @@ export default function Home() {
 					Disconnect
 				</button>
 			</div>
-			<ul className={'list-disc'}>
-				{data.map((item, index) => (
-					<li key={index} className={'list-item'}>
-						{item}
-					</li>
-				))}
-			</ul>
+			<audio ref={audioRef} controls></audio>
 		</div>
 	);
 }

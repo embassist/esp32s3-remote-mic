@@ -1,8 +1,9 @@
 #![no_std]
 #![no_main]
 
+use core::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use embassy_executor::Spawner;
-use embassy_net::{Runner, StackResources};
+use embassy_net::{Ipv4Address, Runner, StackResources};
 use embassy_time::{Duration, Ticker, Timer};
 use embassy_net::udp::{PacketMetadata, UdpSocket};
 use esp_alloc as _;
@@ -14,6 +15,9 @@ use esp_wifi::{
     wifi::{ClientConfiguration, Configuration, WifiController, WifiDevice, WifiEvent, WifiState},
     EspWifiController,
 };
+use smoltcp::phy::PacketMeta;
+use smoltcp::socket::udp::UdpMetadata;
+use smoltcp::wire::IpEndpoint;
 
 macro_rules! mk_static {
     ($t:ty,$val:expr) => {{
@@ -28,13 +32,12 @@ const SSID: &str = env!("SSID");
 const PASSWORD: &str = env!("PASSWORD");
 const PORT: u16 = 8080;
 
-const SAMPLE_RATE: u32 = 8000; // 8kHz sampling
+const SAMPLE_RATE: u64 = 8000; // kHz
+const BYTES_PER_SAMPLE: usize = 2; // 16-bit = 2 bytes
 const CHUNK_SIZE: usize = 512;
-const BITS_PER_SAMPLE: u16 = 16;
-const NUM_CHANNELS: u16 = 1;
-const BYTE_RATE: u32 = SAMPLE_RATE * NUM_CHANNELS as u32 * (BITS_PER_SAMPLE / 8) as u32;
-const BLOCK_ALIGN: u16 = NUM_CHANNELS * (BITS_PER_SAMPLE / 8);
-type WavBuffer = heapless::Deque<u16, CHUNK_SIZE>;
+
+type PCMBuffer = heapless::Vec<i16, CHUNK_SIZE>;
+type UDPBuffer = heapless::Vec<u8, { CHUNK_SIZE * BYTES_PER_SAMPLE }>;
 
 #[esp_hal_embassy::main]
 async fn main(spawner: Spawner) -> ! {
@@ -90,63 +93,37 @@ async fn main(spawner: Spawner) -> ! {
     let mut tx_buffer = [0; 4096];
     let mut rx_meta = [PacketMetadata::EMPTY; 16];
     let mut tx_meta = [PacketMetadata::EMPTY; 16];
-    let mut buf = [0; 4096];
     loop {
         let mut socket = UdpSocket::new(stack, &mut rx_meta, &mut rx_buffer, &mut tx_meta, &mut tx_buffer);
         socket.bind(PORT).unwrap();
-        log::info!("[UDP] Listening...");
+        log::info!("[UDP] Broadcasting...");
 
-        let (n, ep) = socket.recv_from(&mut buf).await.unwrap();
-        if let Ok(s) = core::str::from_utf8(&buf[..n]) {
-            log::info!("[UDP] received {}: {}", ep, s);
-        }
+        let endpoint = UdpMetadata {
+            endpoint: IpEndpoint::new(Ipv4Addr::new(192, 168, 177, 97).into(), 54103),
+            local_address: None,
+            meta: PacketMeta::default(),
+        };
 
-        let mut ticker = Ticker::every(Duration::from_micros(1_000_000 / SAMPLE_RATE as u64));
-        let mut buffer: WavBuffer = heapless::Deque::new();
-        let mut do_headers = true;
+        let mut ticker = Ticker::every(Duration::from_hz(SAMPLE_RATE));
+        let mut packet: PCMBuffer = heapless::Vec::new();
 
         loop {
             ticker.next().await;
             let value: u16 = adc.read_oneshot(&mut pin).await;
-            let _ = buffer.push_back(value).unwrap();
-            if buffer.is_full() {
-                let chunk = into(&mut buffer, do_headers).await;
-                do_headers = false;
-                socket.send_to(chunk.as_slice(), ep).await.unwrap();
+            let chunk = ((value as i32 - 2048) * 32767 / 4095) as i16;
+
+            if packet.push(chunk).is_err() {
+                let mut bytes = UDPBuffer::new();
+                for sample in packet.iter() {
+                    bytes.extend_from_slice(&sample.to_le_bytes())
+                        .expect("Buffer size matches chunk size");
+                }
+                socket.send_to(bytes.as_slice(), endpoint).await.unwrap();
+                log::info!("[UDP] Sent");
+                packet.clear();
             }
         }
     }
-}
-
-async fn into(buffer: &mut WavBuffer, w_headers: bool) -> heapless::Vec<u8, { CHUNK_SIZE * 2 + 44 }> {
-    let mut wav: heapless::Vec<u8, { CHUNK_SIZE * 2 + 44 }> = heapless::Vec::new();
-    let data_size = buffer.len() as u32 * 2;
-    let file_size = data_size + 36;
-
-    if w_headers {
-        wav.extend_from_slice(b"RIFF").ok();
-        wav.extend_from_slice(&file_size.to_le_bytes()).ok();
-        wav.extend_from_slice(b"WAVEfmt ").ok();
-        wav.extend_from_slice(&[16, 0, 0, 0]).ok();
-        wav.extend_from_slice(&[1, 0]).ok();
-        wav.extend_from_slice(&NUM_CHANNELS.to_le_bytes()).ok();
-        wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes()).ok();
-        wav.extend_from_slice(&BYTE_RATE.to_le_bytes()).ok();
-        wav.extend_from_slice(&BLOCK_ALIGN.to_le_bytes()).ok();
-        wav.extend_from_slice(&BITS_PER_SAMPLE.to_le_bytes()).ok();
-        wav.extend_from_slice(b"data").ok();
-        wav.extend_from_slice(&data_size.to_le_bytes()).ok();
-    }
-
-    // Convert ADC samples (0..4095) into signed 16-bit PCM.
-    // Assumes a midpoint of 2048; adjust if necessary.
-    for &sample in buffer.iter() {
-        let sample_i16 = (((sample as i16) - 2048) * 32767) / 2048;
-        wav.extend_from_slice(&sample_i16.to_le_bytes()).ok();
-    }
-
-    buffer.clear();
-    wav
 }
 
 #[embassy_executor::task]

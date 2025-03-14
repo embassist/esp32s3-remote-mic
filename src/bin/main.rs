@@ -110,6 +110,7 @@ async fn main(spawner: Spawner) -> ! {
         loop {
             ticker.next().await;
             let value: u16 = adc.read_oneshot(&mut pin).await;
+            log::info!("[ADC] {}", value);
             let chunk = ((value as i32 - 2048) * 32767 / 4095) as i16;
 
             if packet.push(chunk).is_err() {
@@ -119,7 +120,7 @@ async fn main(spawner: Spawner) -> ! {
                         .expect("Buffer size matches chunk size");
                 }
                 socket.send_to(bytes.as_slice(), endpoint).await.unwrap();
-                log::info!("[UDP] Sent");
+                // log::info!("[UDP] Sent");
                 packet.clear();
             }
         }
